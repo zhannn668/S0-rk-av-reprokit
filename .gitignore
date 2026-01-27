@@ -1,0 +1,13 @@
+cat > .gitignore <<'EOF'
+*.o
+*.a
+*.so
+build/
+bin/
+out.h264
+out.pcm
+out.wav
+.DS_Store
+*.swp
+*.swo
+EOF
