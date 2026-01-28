@@ -151,11 +151,20 @@ int encoder_mpp_init(EncoderMPP *enc,
 
     /* 获取编码器配置句柄。 */
     MppEncCfg cfg = NULL;
-    ret = enc->mpi->control(enc->ctx, MPP_ENC_GET_CFG, &cfg);
+
+    ret = mpp_enc_cfg_init(&cfg);
     if (ret || !cfg) {
-        LOGE("[%s] MPP_ENC_GET_CFG failed: %d", TAG, ret);
+        LOGE("[%s] mpp_enc_cfg_init failed: %d", TAG, ret);
         return -1;
     }
+
+    ret = enc->mpi->control(enc->ctx, MPP_ENC_GET_CFG, cfg);
+    if (ret) {
+        LOGE("[%s] MPP_ENC_GET_CFG failed: %d", TAG, ret);
+        mpp_enc_cfg_deinit(cfg);
+        return -1;
+    }
+
 
     /* prep：输入图像参数与格式。 */
     mpp_enc_cfg_set_s32(cfg, "prep:width",       enc->width);
@@ -180,6 +189,7 @@ int encoder_mpp_init(EncoderMPP *enc,
     ret = enc->mpi->control(enc->ctx, MPP_ENC_SET_CFG, cfg);
     if (ret) {
         LOGE("[%s] MPP_ENC_SET_CFG failed: %d", TAG, ret);
+        encoder_mpp_deinit(enc);
         return -1;
     }
 
