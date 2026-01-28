@@ -18,6 +18,11 @@
 #define VIDEO_MAX_PLANES 8
 #endif
 
+/*
+ * 对 ioctl 的一层薄封装：
+ * - 当 ioctl 被信号打断返回 EINTR 时自动重试
+ * - 其余错误由调用者根据 errno 处理
+ */
 static int xioctl(int fd, int req, void *arg)
 {
     int r;
@@ -27,7 +32,13 @@ static int xioctl(int fd, int req, void *arg)
     return r;
 }
 
-
+/*
+ * 将 V4L2 FOURCC（4 字节像素格式）转换成可读字符串，便于日志打印。
+ * 例如：V4L2_PIX_FMT_NV12M -> "NM12"（具体字符取决于 fourcc 值）。
+ *
+ * @param fourcc  输入 fourcc
+ * @param out     输出缓冲区，要求至少 5 字节（含 '\0'）
+ */
 static void fourcc_to_str(uint32_t fourcc, char out[5])
 {
     out[0] = (fourcc) & 0xff;
@@ -37,6 +48,12 @@ static void fourcc_to_str(uint32_t fourcc, char out[5])
     out[4] = '\0';
 }
 
+/*
+ * 查询并打印当前设备实际生效的视频格式（VIDIOC_G_FMT）。
+ *
+ * 注意：驱动可能会对用户设置的格式做调整（例如对齐、stride、sizeimage），
+ * 通过该函数可以看到最终值。
+ */
 void v4l2_capture_dump_format(V4L2Capture *cap)
 {
     if (!cap || cap->fd < 0) return;
@@ -63,6 +80,19 @@ void v4l2_capture_dump_format(V4L2Capture *cap)
     }
 }
 
+/*
+ * 打开 V4L2 设备并初始化采集：
+ * 1) open 设备节点
+ * 2) 设置采集格式（当前实现固定为 NV12M 两平面）
+ * 3) 申请 MMAP buffers，逐个 mmap 映射每个 buffer 的各个 plane
+ * 4) 将所有 buffer 入队（QBUF），为后续 STREAMON + DQBUF 做准备
+ *
+ * @param cap    采集上下文（输出）
+ * @param dev    设备路径（例如 /dev/video0）
+ * @param width  期望宽度
+ * @param height 期望高度
+ * @return       0 成功；-1 失败（失败时内部会清理资源）
+ */
 int v4l2_capture_open(V4L2Capture *cap, const char *dev,
                       unsigned int width, unsigned int height)
 {
@@ -77,7 +107,10 @@ int v4l2_capture_open(V4L2Capture *cap, const char *dev,
         return -1;
     }
 
-    /* 设置格式：NV12M 多平面 */
+    /*
+     * 设置格式：NV12M 多平面（Y/UV 两个 plane）。
+     * 注意：驱动可能会调整 width/height/stride/sizeimage，后面会 dump 一次。
+     */
     struct v4l2_format fmt;
     memset(&fmt, 0, sizeof(fmt));
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -97,6 +130,10 @@ int v4l2_capture_open(V4L2Capture *cap, const char *dev,
     cap->height = height;
     cap->frame_size = width * height * 3 / 2;
 
+    /*
+     * 上层期望拿到连续内存的 NV12（Y + UV），而 NV12M 是多平面：
+     * 这里额外申请一块连续缓冲用于“合帧”。
+     */
     cap->nv12_frame = (uint8_t *)malloc(cap->frame_size);
     if (!cap->nv12_frame) {
         LOGE("[%s] malloc nv12_frame failed", TAG);
@@ -109,7 +146,10 @@ int v4l2_capture_open(V4L2Capture *cap, const char *dev,
 
     v4l2_capture_dump_format(cap);
 
-    /* 申请 buffer */
+    /*
+     * 申请内核侧采集 buffer（MMAP）。驱动会返回实际分配的 count。
+     * 一般至少需要 2 个 buffer 才能较平滑地采集。
+     */
     struct v4l2_requestbuffers req;
     memset(&req, 0, sizeof(req));
     req.count  = V4L2_MAX_BUFS;
@@ -129,7 +169,10 @@ int v4l2_capture_open(V4L2Capture *cap, const char *dev,
     if (cap->buf_count > V4L2_MAX_BUFS)
         cap->buf_count = V4L2_MAX_BUFS;   // 保护一下
 
-    /* mmap 每个 buffer 的两个 plane：Y / UV */
+    /*
+     * mmap 每个 buffer 的两个 plane：Y / UV
+     * 典型流程：QUERYBUF 获取每个 plane 的 offset/length，然后逐 plane mmap。
+     */
     for (unsigned int i = 0; i < cap->buf_count; i++) {
         struct v4l2_buffer buf;
         struct v4l2_plane  planes[VIDEO_MAX_PLANES];
@@ -148,6 +191,10 @@ int v4l2_capture_open(V4L2Capture *cap, const char *dev,
             goto fail;
         }
 
+        /*
+         * 映射各 plane 内存。
+         * plane 0 通常是 Y，plane 1 通常是 UV（NV12M）。
+         */
         for (unsigned int p = 0; p < buf.length && p < V4L2_MAX_PLANES && p < V4L2_MAX_PLANES; p++) {
             size_t len = planes[p].length;
             void *addr = mmap(NULL, len,
@@ -164,7 +211,7 @@ int v4l2_capture_open(V4L2Capture *cap, const char *dev,
             cap->bufs[i].lengths[p] = len;
         }
 
-        /* buffer 入队 */
+        /* buffer 入队：让驱动可以往该 buffer 里填充下一帧数据 */
         if (xioctl(cap->fd, VIDIOC_QBUF, &buf) < 0) {
             LOGE("[%s] QBUF[%u] failed: %s", TAG, i, strerror(errno));
             goto fail;
@@ -179,6 +226,10 @@ fail:
     return -1;
 }
 
+/*
+ * 启动视频流（VIDIOC_STREAMON）。
+ * 需要在 open() 完成并且至少有若干 buffer 已 QBUF 入队后调用。
+ */
 int v4l2_capture_start(V4L2Capture *cap)
 {
     if (!cap || cap->fd < 0) return -1;
@@ -193,7 +244,16 @@ int v4l2_capture_start(V4L2Capture *cap)
     return 0;
 }
 
-/* 从 NV12M 两个 plane 合成一帧连续 NV12，返回给上层 */
+/*
+ * 出队一个已填充的采集 buffer（VIDIOC_DQBUF），并将 NV12M 两个 plane
+ * 合成为一帧连续 NV12（Y + UV）返回给上层。
+ *
+ * @param cap     采集上下文
+ * @param index   输出：本次出队的 buffer 索引（后续需要用 qbuf 归还）
+ * @param data    输出：指向连续 NV12 数据（cap->nv12_frame）
+ * @param length  输出：数据长度（固定为 cap->frame_size）
+ * @return        0 成功；1 暂时无数据（EAGAIN）；-1 失败
+ */
 int v4l2_capture_dqbuf(V4L2Capture *cap, int *index,
                        void **data, size_t *length)
 {
@@ -213,6 +273,7 @@ int v4l2_capture_dqbuf(V4L2Capture *cap, int *index,
 
     int r = xioctl(cap->fd, VIDIOC_DQBUF, &buf);
     if (r < 0) {
+        /* 非阻塞模式下，EAGAIN 表示当前没有帧可取 */
         if (errno == EAGAIN) return 1;   // 暂时没数据
         LOGE("[%s] DQBUF failed: %s", TAG, strerror(errno));
         return -1;
@@ -223,11 +284,14 @@ int v4l2_capture_dqbuf(V4L2Capture *cap, int *index,
     cap->last_index = idx;
     cap->last_sequence = buf.sequence;
 
-    // NV12M: plane0 = Y, plane1 = UV
+    /* NV12M: plane0 = Y, plane1 = UV */
     size_t y_size  = cap->width * cap->height;
     size_t uv_size = cap->width * cap->height / 2;
 
-    // 防止 bytesused 比理论值小
+    /*
+     * 防止 bytesused 比理论值小：某些驱动可能返回更小的有效数据长度。
+     * 这里按较小者拷贝，避免越界读。
+     */
     if (planes[0].bytesused && planes[0].bytesused < y_size)
         y_size = planes[0].bytesused;
     if (planes[1].bytesused && planes[1].bytesused < uv_size)
@@ -235,6 +299,7 @@ int v4l2_capture_dqbuf(V4L2Capture *cap, int *index,
 
     uint8_t *dst = cap->nv12_frame;
 
+    /* 合帧：Y 紧跟 UV，组成连续 NV12 */
     memcpy(dst,
            cap->bufs[idx].planes[0],
            y_size);
@@ -249,6 +314,13 @@ int v4l2_capture_dqbuf(V4L2Capture *cap, int *index,
     return 0;
 }
 
+/*
+ * 将使用完的 buffer 重新入队（VIDIOC_QBUF），让驱动继续复用该 buffer 存放后续帧。
+ *
+ * @param cap    采集上下文
+ * @param index  buffer 索引（通常来自 dqbuf 输出）
+ * @return       0 成功；-1 失败
+ */
 int v4l2_capture_qbuf(V4L2Capture *cap, int index)
 {
     if (!cap || cap->fd < 0) return -1;
@@ -273,11 +345,19 @@ int v4l2_capture_qbuf(V4L2Capture *cap, int index)
     return 0;
 }
 
+/*
+ * 关闭采集并释放资源：
+ * - 尝试 STREAMOFF
+ * - munmap 所有已映射的 plane
+ * - close fd
+ * - free 合帧缓冲（nv12_frame）
+ */
 void v4l2_capture_close(V4L2Capture *cap)
 {
     if (!cap) return;
 
     if (cap->fd >= 0) {
+        /* 即使未 STREAMON，STREAMOFF 失败也不致命，这里忽略返回值 */
         enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         xioctl(cap->fd, VIDIOC_STREAMOFF, &type);
     }

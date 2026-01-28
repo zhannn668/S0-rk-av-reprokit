@@ -17,6 +17,12 @@
 static volatile sig_atomic_t g_stop = 0;
 static AvStats g_stats;
 
+/*
+ * 信号处理函数：收到 SIGINT/SIGTERM 时设置全局停止标志。
+ *
+ * 约束：信号处理上下文里应尽量只做“最小且异步安全”的操作。
+ * 这里仅写一个 sig_atomic_t 标志位，供各线程轮询并退出。
+ */
 static void on_sigint(int signo)
 {
     (void)signo;
@@ -28,6 +34,11 @@ typedef struct {
     unsigned int sec;
 } TimerArgs;
 
+/*
+ * 计时器线程：睡眠指定秒数后将 g_stop 置 1，触发全局停止。
+ *
+ * @param arg  TimerArgs*，包含录制时长（秒）
+ */
 static void *timer_thread(void *arg)
 {
     TimerArgs *t = (TimerArgs *)arg;
@@ -38,6 +49,9 @@ static void *timer_thread(void *arg)
 }
 
 /* ===================== Stats Thread ===================== */
+/*
+ * 统计线程：每秒打印一次统计信息，直到 g_stop 被置位。
+ */
 static void *stats_thread(void *arg)
 {
     (void)arg;
@@ -53,6 +67,14 @@ typedef struct {
     const AppConfig *cfg;
 } AudioArgs;
 
+/*
+ * 音频线程：
+ * - 打开 ALSA 音频采集
+ * - 按 chunk 读取 PCM 并写入文件
+ * - 达到时长限制或收到停止信号后退出
+ *
+ * @param arg  AudioArgs*，包含 AppConfig 指针
+ */
 static void *audio_thread(void *arg)
 {
     AudioArgs *a = (AudioArgs *)arg;
@@ -76,9 +98,14 @@ static void *audio_thread(void *arg)
 
     LOGI("[audio] start capture -> %s", cfg->output_path_pcm);
 
+    /*
+     * 计算目标写入字节数：duration_sec>0 则按秒数限制；否则认为无限（直到外部 stop）。
+     * bytes_per_frame 表示“每个采样帧”的字节数（与位深/声道有关）。
+     */
     size_t bytes_per_sec = (size_t)ac.sample_rate * (size_t)ac.bytes_per_frame;
     size_t total_bytes   = (cfg->duration_sec > 0) ? (bytes_per_sec * (size_t)cfg->duration_sec) : (size_t)-1;
 
+    /* 单次读写的 chunk 大小（按 ALSA period 计算）。 */
     size_t chunk = (size_t)ac.frames_per_period * (size_t)ac.bytes_per_frame;
     uint8_t *buf = (uint8_t *)malloc(chunk);
     if (!buf) {
@@ -93,6 +120,7 @@ static void *audio_thread(void *arg)
     while (!g_stop && written < total_bytes) {
         ssize_t n = audio_capture_read(&ac, buf, chunk);
         if (n <= 0) {
+            /* 读不到数据就小睡一下，避免忙等占满 CPU。 */
             struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000 * 1000 }; // 1ms
             nanosleep(&ts, NULL);
 
@@ -105,6 +133,7 @@ static void *audio_thread(void *arg)
             break;
         }
         written += wn;
+        /* 音频 chunk 统计：用于每秒打印的速率与累计。 */
         av_stats_inc_audio_chunk(&g_stats);
     }
 
@@ -121,6 +150,15 @@ typedef struct {
     const AppConfig *cfg;
 } VideoArgs;
 
+/*
+ * 视频线程：
+ * - 打开 V4L2 采集（当前使用 NV12M 多平面，内部合成为连续 NV12）
+ * - 初始化 MPP H.264 编码器
+ * - 采集帧 -> 编码 -> 写入 sink（文件）
+ * - 达到时长/帧数限制或收到停止信号后退出
+ *
+ * @param arg  VideoArgs*，包含 AppConfig 指针
+ */
 static void *video_thread(void *arg)
 {
     VideoArgs *v = (VideoArgs *)arg;
@@ -141,6 +179,7 @@ static void *video_thread(void *arg)
     }
     v4l2_capture_start(&cap);
 
+    /* 初始化硬编码器：当前选择 AVC(H.264)。 */
     ret = encoder_mpp_init(&enc, cfg->width, cfg->height, cfg->fps, cfg->bitrate, MPP_VIDEO_CodingAVC);
     if (ret) {
         LOGE("[video] encoder_mpp_init failed");
@@ -149,6 +188,7 @@ static void *video_thread(void *arg)
         return NULL;
     }
 
+    /* 输出端：当前落盘为 .h264 文件。 */
     enc_sink_init(&sink, ENC_SINK_FILE, cfg->output_path_h264);
     if (enc_sink_open(&sink) != 0) {
         LOGE("[video] enc_sink_open failed: %s", cfg->output_path_h264);
@@ -162,6 +202,7 @@ static void *video_thread(void *arg)
 
     uint32_t last_seq = 0;
     int      has_seq = 0;
+    /* 若配置了 sec 与 fps，则将录制时长转换为目标帧数；0 表示不限制（直到 stop）。 */
     int      frames_target = (cfg->duration_sec > 0 && cfg->fps > 0) ? (int)(cfg->duration_sec * (unsigned int)cfg->fps) : 0;
     int      frames = 0;
 
@@ -172,13 +213,14 @@ static void *video_thread(void *arg)
 
         ret = v4l2_capture_dqbuf(&cap, &index, &data, &len);
         if (ret != 0) {
+            /* 非阻塞采集：可能暂时无帧（EAGAIN），小睡一下再试。 */
             struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000 * 1000 }; // 1ms
             nanosleep(&ts, NULL);
 
             continue;
         }
 
-        // drop 统计：sequence gap
+        /* drop 统计：根据 v4l2 sequence 检测丢帧（序号跳变）。 */
         if (!has_seq) {
             last_seq = cap.last_sequence;
             has_seq = 1;
@@ -212,12 +254,20 @@ static void *video_thread(void *arg)
 }
 
 /* ===================== Main ===================== */
+/*
+ * 程序入口：
+ * - 注册信号处理（Ctrl+C 停止）
+ * - 加载默认配置并解析命令行
+ * - 启动线程：统计/定时停止/视频/音频
+ * - 等待线程退出并收尾
+ */
 int main(int argc, char **argv)
 {
     signal(SIGINT, on_sigint);
     signal(SIGTERM, on_sigint);
 
     AppConfig cfg;
+    /* 先加载默认值，再用命令行参数覆盖。 */
     app_config_load_default(&cfg);
     if (app_config_parse_args(&cfg, argc, argv) != 0) {
         app_config_print_usage(argv[0]);
@@ -268,6 +318,7 @@ int main(int argc, char **argv)
     }
 
     pthread_join(th_a, NULL);
+    /* 音频线程结束后，确保停止标志置位，促使其他线程尽快退出。 */
     g_stop = 1; // ensure stop
     pthread_join(th_v, NULL);
 
