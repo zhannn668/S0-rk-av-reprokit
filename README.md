@@ -143,6 +143,11 @@ ffprobe -hide_banner -f s16le -ar 48000 -ac 2 -show_streams -show_format out.pcm
 ffmpeg -y -f s16le -ar 48000 -ac 2 -i out.pcm out.wav
 mediainfo out.h264
 mediainfo out.wav
+
+ffplay -fflags nobuffer -flags low_delay -framerate 30 -f h264 out.h264
+
+ffplay -f s16le -ar 48000 -ac 2 out.pcm
+
 ```
 
 ---
@@ -162,6 +167,36 @@ mediainfo out.wav
 ### 3) 音频设备打不开
 - 用 `arecord -l` 查看设备
 - 修改 `--audio-dev` 为实际 ALSA 设备，例如 `hw:1,0`
+
+---
+
+## 当前阶段：S0 基线固化
+
+### 目标
+
+让当前工程每次跑结果都能对比，方便后续改动不引入隐性回退。
+
+### 你要做什么（具体）
+
+1. **统一配置入口**
+
+* 把分辨率/帧率/码率/音频采样率/通道数/设备节点统一放到 `app_config.*`（或 config 文件）
+* 运行时打印一行“最终配置摘要”
+
+2. **统一日志与统计**
+
+* 每秒打印：`video_fps / enc_bitrate / audio_chunks_per_sec / drop_count`
+* 打印当前设备格式：fourcc、stride、plane 信息（后面查花屏很关键）
+
+3. **输出可复现实验文件**
+
+* 录像 10s 输出：`out.h264` + `out.pcm`（或 wav）
+* 再用 `ffprobe`/`mediainfo` 做一次检查（写在 docs 里）
+
+### 验收
+
+* 每次运行 10s 输出文件一致可播放
+* 日志每秒稳定输出统计
 
 ---
 
